@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from hermex_screen.control import IDLE_LIMIT, Control, viewer_hash
-from hermex_screen.driver import contract_problem
+from hermex_screen.control import IDLE_LIMIT, Control, ControlLost, viewer_hash
+from hermex_screen.driver import CuaDriver, DriverUnavailable, contract_problem
 
 
 @dataclass
@@ -111,6 +111,66 @@ class ControlTests(unittest.TestCase):
         reborn.tick()
         self.assertEqual(self.holders(), {"/a": "agent", "/b": "agent"})
         self.assertFalse(self.path.exists())
+
+
+    def test_a_restart_never_takes_back_a_lease_someone_else_took_meanwhile(self):
+        self.control().acquire("v1")
+        self.leases.acquire("someone-else", profile_key="/a")
+        reborn = self.control()
+        reborn.tick()
+        self.assertIsNone(reborn.holder)
+        self.assertEqual(self.leases.get("/a").viewer_id, "someone-else")
+        self.assertEqual(self.holders()["/b"], "agent")
+
+    def test_a_failure_partway_through_a_takeover_strands_no_lease(self):
+        control = self.control()
+        original = self.leases.acquire
+
+        def fail_second(viewer_id, *, profile_key=None, reason=""):
+            if profile_key == "/b":
+                raise OSError("disk full")
+            original(viewer_id, profile_key=profile_key, reason=reason)
+        self.leases.acquire = fail_second
+        with self.assertRaises(OSError):
+            control.acquire("v1")
+        self.assertEqual(self.holders(), {"/a": "agent", "/b": "agent"})
+        self.assertIsNone(control.holder)
+
+    def test_a_replacement_failing_partway_strands_neither_holder(self):
+        control = self.control()
+        control.acquire("v1")
+        original = self.leases.acquire
+
+        def fail_second(viewer_id, *, profile_key=None, reason=""):
+            if profile_key == "/b":
+                raise OSError("disk full")
+            original(viewer_id, profile_key=profile_key, reason=reason)
+        self.leases.acquire = fail_second
+        with self.assertRaises(OSError):
+            control.acquire("v2")
+        self.assertEqual(self.holders(), {"/a": "agent", "/b": "agent"})
+
+    def test_input_after_control_is_lost_is_refused(self):
+        control = self.control()
+        control.acquire("v1")
+        with control.while_holding("v1"):
+            pass
+        control.release("v1")
+        with self.assertRaises(ControlLost):
+            with control.while_holding("v1"):
+                self.fail("the operation must not run")
+
+
+class DriverContractTests(unittest.TestCase):
+    def test_a_driver_that_cant_do_the_job_does_none_of_it(self):
+        driver = CuaDriver(command="unused", env={})
+        driver.tools = lambda: []
+        driver.problem = "this driver has no click tool"
+        called = []
+        driver._request = lambda *args: called.append(args) or {}
+        with self.assertRaises(DriverUnavailable):
+            driver.call("click", x=1, y=1)
+        self.assertEqual(called, [])
 
 
 class ContractTests(unittest.TestCase):

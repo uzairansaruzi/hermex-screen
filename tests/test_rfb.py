@@ -1,6 +1,8 @@
 import unittest
 
-from hermex_screen.rfb import ClientParser, Key, Pointer, ProtocolError, UpdateRequest, jpeg_update, server_init
+from hermex_screen.rfb import (
+    ClientParser, HandshakeReply, Key, Pointer, ProtocolError, UpdateRequest, jpeg_update, server_init,
+)
 
 
 class ParserTests(unittest.TestCase):
@@ -13,7 +15,8 @@ class ParserTests(unittest.TestCase):
                 + bytes([5, 1, 0, 10, 0, 20]))               # PointerEvent
 
     def test_messages_come_out_the_same_at_any_chunk_boundary(self):
-        expected = [UpdateRequest(incremental=True), Key(down=True, keysym=0x61), Pointer(buttons=1, x=10, y=20)]
+        expected = [HandshakeReply("security"), HandshakeReply("security_result"), HandshakeReply("server_init"),
+                    UpdateRequest(incremental=True), Key(down=True, keysym=0x61), Pointer(buttons=1, x=10, y=20)]
         data = self.stream()
         for size in (len(data), 7, 1):
             parser = ClientParser()
@@ -21,6 +24,13 @@ class ParserTests(unittest.TestCase):
             for start in range(0, len(data), size):
                 out += parser.feed(data[start:start + size])
             self.assertEqual(out, expected)
+
+    def test_each_handshake_reply_waits_for_the_clients_own_bytes(self):
+        parser = ClientParser()
+        self.assertEqual(parser.feed(b"RFB 003.0"), [])
+        self.assertEqual(parser.feed(b"08\n"), [HandshakeReply("security")])
+        self.assertEqual(parser.feed(bytes([1])), [HandshakeReply("security_result")])
+        self.assertEqual(parser.feed(bytes([1])), [HandshakeReply("server_init")])
 
     def test_an_unknown_message_closes_rather_than_hiding_input_behind_it(self):
         parser = ClientParser()

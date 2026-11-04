@@ -83,6 +83,7 @@ class CuaDriver:
         self._next_id = 0
         self._tools: list[dict[str, Any]] = []
         self.version: Optional[str] = None
+        self.problem: Optional[str] = None
 
     def _start(self) -> None:
         command = self._command or resolve_command()
@@ -100,6 +101,7 @@ class CuaDriver:
         self.version = ((reply.get("result") or {}).get("serverInfo") or {}).get("version")
         self._send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self._tools = (self._request("tools/list", {}).get("result") or {}).get("tools") or []
+        self.problem = contract_problem(self._tools)
 
     @staticmethod
     def _read_lines(process: subprocess.Popen, lines: "queue.Queue[Optional[str]]") -> None:
@@ -138,6 +140,9 @@ class CuaDriver:
         """One tool call. Raises DriverUnavailable for a driver failure or a refused action."""
         with self._lock:
             self.tools()
+            # A driver that can't do the whole job does none of it, so control is never half there.
+            if self.problem:
+                raise DriverUnavailable(self.problem)
             reply = self._request("tools/call", {"name": name, "arguments": arguments})
         result = reply.get("result") or {}
         if reply.get("error") or result.get("isError"):
@@ -156,6 +161,18 @@ class CuaDriver:
 
     def stop(self) -> None:
         with self._lock:
-            if self._process is not None:
-                self._process.terminate()
-                self._process = None
+            process, self._process = self._process, None
+            if process is None:
+                return
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            # Only once it has gone: closing its stdout blocks while the reader thread is in it.
+            for pipe in (process.stdin, process.stdout):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass

@@ -12,9 +12,17 @@ VERSION = b"RFB 003.008\n"
 SECURITY_NONE = bytes([1, 1])
 SECURITY_OK = bytes(4)
 _HANDSHAKE = 12 + 1 + 1
+# After the version, the security choice and ClientInit, in the client's bytes still to come.
+_HANDSHAKE_REPLIES = {2: "security", 1: "security_result", 0: "server_init"}
 _MAX_CUT_TEXT = 256 * 1024
 
 _FIXED = {0: 20, 3: 10, 4: 8, 5: 6, 150: 10, 255: 12}
+
+
+@dataclass(frozen=True)
+class HandshakeReply:
+    """The client reached this point in the handshake, so the server's next part is due."""
+    stage: str
 
 
 @dataclass(frozen=True)
@@ -48,13 +56,17 @@ class ClientParser:
 
     def feed(self, chunk: bytes) -> list[object]:
         self._buffer += chunk
-        if self._handshake_left:
-            taken = min(self._handshake_left, len(self._buffer))
+        messages: list[object] = []
+        while self._handshake_left and self._buffer:
+            # A step at a time, so each reply goes out when its own byte has arrived.
+            step = self._handshake_left - 2 if self._handshake_left > 2 else 1
+            taken = min(step, len(self._buffer))
             del self._buffer[:taken]
             self._handshake_left -= taken
-            if self._handshake_left:
-                return []
-        messages: list[object] = []
+            if self._handshake_left in _HANDSHAKE_REPLIES:
+                messages.append(HandshakeReply(_HANDSHAKE_REPLIES[self._handshake_left]))
+        if self._handshake_left:
+            return messages
         while self._buffer:
             length = self._length()
             if length is None or len(self._buffer) < length:

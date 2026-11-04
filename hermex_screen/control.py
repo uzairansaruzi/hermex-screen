@@ -16,14 +16,19 @@ import logging
 import os
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 
 IDLE_LIMIT = 15 * 60
 LOOP_INTERVAL = 2.0
 _REASON = "hermex-screen"
+
+
+class ControlLost(RuntimeError):
+    """This viewer no longer holds control, so nothing more of its input may run."""
 
 
 def viewer_hash(viewer_id: Optional[str]) -> Optional[str]:
@@ -47,6 +52,8 @@ class Control:
         self._last_input = 0.0
         # The Profiles this hold has reached. One of them showing no hold means it ended elsewhere.
         self._applied: set[str] = set()
+        # A holder being replaced, whose leases may remain if the replacement stops partway.
+        self._replacing: Optional[str] = None
         self._listeners: list[Callable[[Optional[str], bool], None]] = []
         self._thread: Optional[threading.Thread] = None
         self._load()
@@ -57,6 +64,15 @@ class Control:
 
     def may_send_input(self, viewer_id: str) -> bool:
         return self._holder == viewer_id
+
+    @contextmanager
+    def while_holding(self, viewer_id: str) -> Iterator[None]:
+        """Runs one input operation only while `viewer_id` holds, and makes a hand-back wait for it,
+        so no key lands after control has returned to the bot."""
+        with self._lock:
+            if self._holder != viewer_id:
+                raise ControlLost()
+            yield
 
     def subscribe(self, listener: Callable[[Optional[str], bool], None]) -> Callable[[], None]:
         """`listener(holder, expired)` hears each change of holder, from any thread."""
@@ -71,15 +87,24 @@ class Control:
 
     def acquire(self, viewer_id: str) -> None:
         with self._lock:
-            self._applied = set()
-            for path in self._profile_paths():
-                self._lease.acquire(viewer_id, profile_key=path, reason=_REASON)
-                self._applied.add(path)
-            self._holder = viewer_id
+            previous = self._holder
+            paths = self._profile_paths()
+            # Saved first and listing every Profile, so a crash partway through can't strand a lease.
+            self._holder, self._applied = viewer_id, set(paths)
+            self._replacing = previous if previous != viewer_id else None
             self._last_input = self._clock()
             self._save()
+            try:
+                for path in paths:
+                    self._lease.acquire(viewer_id, profile_key=path, reason=_REASON)
+            except Exception:
+                self._release_all(viewer_id)
+                raise
+            self._replacing = None
+            self._save()
             self._ensure_loop()
-        self._notify(viewer_id, expired=False)
+            if previous != viewer_id:
+                self._notify(viewer_id, expired=False)
 
     def release(self, viewer_id: Optional[str]) -> None:
         """Releases `viewer_id`'s hold, which leaves anyone else's in place. None clears any holder,
@@ -88,13 +113,16 @@ class Control:
             if viewer_id is not None and viewer_id != self._holder:
                 return
             self._release_all(viewer_id)
-        self._notify(None, expired=False)
+            self._notify(None, expired=False)
 
     def _release_all(self, viewer_id: Optional[str]) -> None:
         for path in self._profile_paths():
             self._lease.release(viewer_id, profile_key=path)
+            if self._replacing is not None:
+                self._lease.release(self._replacing, profile_key=path)
         self._holder = None
         self._applied = set()
+        self._replacing = None
         self._save()
 
     def note_input(self) -> None:
@@ -106,24 +134,23 @@ class Control:
 
     def tick(self) -> None:
         """Reaches a new Profile, and hands back at the idle limit or once a lease shows it ended."""
-        ended = False
         with self._lock:
             if self._holder is None:
                 return
             paths = self._profile_paths()
             if self._clock() - self._last_input >= IDLE_LIMIT or any(
                     self._lease.get(path).viewer_id != self._holder for path in paths if path in self._applied):
-                # Past the limit, or handed back or taken on some Profile by another client.
+                # Past the limit, or handed back or taken on some Profile by another client. Naming
+                # the id leaves anyone else's lease alone.
                 self._release_all(self._holder)
-                ended = True
+                self._notify(None, expired=True)
             else:
                 for path in paths:
                     if path not in self._applied:
-                        self._lease.acquire(self._holder, profile_key=path, reason=_REASON)
                         self._applied.add(path)
+                        self._save()
+                        self._lease.acquire(self._holder, profile_key=path, reason=_REASON)
                 self._save()
-        if ended:
-            self._notify(None, expired=True)
 
     def _ensure_loop(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -140,9 +167,9 @@ class Control:
                 logger.exception("hermex-screen: control loop")
 
     def _notify(self, holder: Optional[str], expired: bool) -> None:
-        with self._lock:
-            listeners = list(self._listeners)
-        for listener in listeners:
+        """Called inside the lock, so listeners hear changes in the order they happened. They only
+        schedule work on their own loop."""
+        for listener in list(self._listeners):
             listener(holder, expired)
 
     def _load(self) -> None:
@@ -155,7 +182,10 @@ class Control:
             return
         self._holder = holder
         self._last_input = float(saved.get("last_input") or 0.0)
-        self._applied = {path for path in self._profile_paths() if self._lease.get(path).viewer_id == holder}
+        # What it reached, as saved. A Profile that shows someone else now was taken after this hold,
+        # so the next tick ends the hold rather than taking that Profile back.
+        self._applied = {str(path) for path in saved.get("applied") or []}
+        self._replacing = saved.get("replacing") if isinstance(saved.get("replacing"), str) else None
         # The timer carries on from where it was, and a hold the host no longer shows just ends.
         self._ensure_loop()
 
@@ -167,5 +197,6 @@ class Control:
         temporary = self._path.with_suffix(".tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as handle:
-            json.dump({"holder": self._holder, "last_input": self._last_input}, handle)
+            json.dump({"holder": self._holder, "last_input": self._last_input, "applied": sorted(self._applied),
+                       "replacing": self._replacing}, handle)
         os.replace(temporary, self._path)

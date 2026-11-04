@@ -1,7 +1,8 @@
 """Applies RFB input to the desktop through cua-driver, strictly in order.
 
-A key goes to the frontmost window, so before a tap lands the window under it comes forward, and a
-password can't reach a different app than the one tapped. A press and release in one place is a
+A key goes to the frontmost window, so before a tap lands the window under it comes forward. Before
+later keys, an app that has since taken the front gives way to the tapped window again, or the keys
+are dropped if it's gone, so a password can't reach a different app than the one tapped. A press and release in one place is a
 click; a press that moved is a drag; wheel buttons scroll.
 
 Pasting is asynchronous: the app reads the clipboard when it handles the shortcut, so the next
@@ -12,8 +13,10 @@ wheel gesture's clicks also merge, because each driver scroll takes about 300 ms
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Optional
+from contextlib import nullcontext
+from typing import Any, Callable, ContextManager, Optional
 
+from .driver import DriverUnavailable
 from .keys import MODIFIERS, Paste, Press, action_for
 from .rfb import Key, Pointer
 
@@ -27,11 +30,17 @@ _DRIVER_APP = "Cua Driver"
 
 class InputMapper:
     """`scale` turns framebuffer pixels into the driver's screenshot pixels, and `point_scale` those
-    into the points `list_windows` reports."""
+    into the points `list_windows` reports. `guard()` wraps each driver call that acts on the
+    desktop, and raises to stop the rest of a batch once this viewer has lost control."""
 
-    def __init__(self, driver: Any, platform: str, sleep: Callable[[float], None] = time.sleep) -> None:
+    def __init__(self, driver: Any, platform: str, sleep: Callable[[float], None] = time.sleep,
+                 guard: Callable[[], ContextManager[None]] = nullcontext) -> None:
         self._driver = driver
         self._sleep = sleep
+        self._guard = guard
+        self._target: Optional[dict[str, Any]] = None
+        # The tapped window couldn't come back, so keys wait for a new tap rather than go elsewhere.
+        self._keys_blocked = False
         self._paste_modifier = "ctrl" if platform == "win32" else "cmd"
         self.scale = 1.0
         self.point_scale = 1.0
@@ -41,8 +50,34 @@ class InputMapper:
         self._pressed_at: Optional[tuple[int, int]] = None
         self.pasted = False
 
+    def _act(self, name: str, **arguments: Any) -> dict[str, Any]:
+        with self._guard():
+            return self._driver.call(name, **arguments)
+
+    def _keys_may_land(self) -> bool:
+        """Puts the tapped window back in front if another app has taken it, before a key goes out.
+        With no tap yet, keys go to whatever the picture shows in front."""
+        if self._keys_blocked:
+            return False
+        if self._target is None:
+            return True
+        result = self._driver.call("list_windows", on_screen_only=True)
+        windows = [window for window in (result.get("structuredContent") or {}).get("windows") or []
+                   if _is_ordinary(window)]
+        front = max(windows, key=lambda item: item.get("z_index") or 0, default=None)
+        if front is not None and front.get("pid") == self._target["pid"]:
+            return True
+        try:
+            self._act("bring_to_front", pid=self._target["pid"], window_id=self._target["window_id"])
+            return True
+        except DriverUnavailable:
+            self._keys_blocked = True
+            return False
+
     def apply(self, events: list[object]) -> None:
         """Applies events in order, as one batch, so what piled up during a slow call can merge."""
+        # Asked at the first key after each tap, since a tap in this same batch changes the answer.
+        keys_may_land: Optional[bool] = None
         pasting = ""
         scrolling: Optional[list[Any]] = None
 
@@ -53,11 +88,17 @@ class InputMapper:
                 pasting = ""
             if scrolling is not None:
                 x, y = self._true(scrolling[1], scrolling[2])
-                self._driver.call("scroll", direction=scrolling[0], amount=scrolling[3], x=x, y=y, scope="desktop")
+                self._act("scroll", direction=scrolling[0], amount=scrolling[3], x=x, y=y, scope="desktop")
                 scrolling = None
 
         for event in events:
             if isinstance(event, Key):
+                if event.down and event.keysym not in MODIFIERS:
+                    if keys_may_land is None:
+                        flush()
+                        keys_may_land = self._keys_may_land()
+                    if not keys_may_land:
+                        continue
                 action = action_for(event.keysym) if event.keysym not in MODIFIERS else None
                 if isinstance(action, Paste):
                     if event.down:
@@ -81,6 +122,7 @@ class InputMapper:
                 else:
                     flush()
                     self._pointer(event)
+                    keys_may_land = None
         flush()
 
     def _true(self, x: int, y: int) -> tuple[float, float]:
@@ -97,11 +139,11 @@ class InputMapper:
             modifiers = set(self._held)
             if action.shift:
                 modifiers.add("shift")
-            self._driver.call("press_key", key=action.key, modifiers=sorted(modifiers), scope="desktop")
+            self._act("press_key", key=action.key, modifiers=sorted(modifiers), scope="desktop")
 
     def _paste(self, text: str) -> None:
-        self._driver.call("clipboard_write", text=text)
-        self._driver.call("hotkey", keys=[self._paste_modifier, "v"], scope="desktop")
+        self._act("clipboard_write", text=text)
+        self._act("hotkey", keys=[self._paste_modifier, "v"], scope="desktop")
         self.pasted = True
         self._sleep(_PASTE_SETTLE)
 
@@ -131,10 +173,10 @@ class InputMapper:
         modifiers = sorted(self._held)
         extra = {"modifier": modifiers} if modifiers else {}
         if abs(event.x - start[0]) > _DRAG_SLOP or abs(event.y - start[1]) > _DRAG_SLOP:
-            self._driver.call("drag", from_x=from_x, from_y=from_y, to_x=x, to_y=y, button=button,
+            self._act("drag", from_x=from_x, from_y=from_y, to_x=x, to_y=y, button=button,
                               scope="desktop", duration_ms=200, steps=8, **extra)
         else:
-            self._driver.call("click", x=x, y=y, button=button, scope="desktop", **extra)
+            self._act("click", x=x, y=y, button=button, scope="desktop", **extra)
 
     def _bring_forward(self, x: float, y: float) -> None:
         """Brings the topmost window under a screenshot-pixel point forward, if it isn't already."""
@@ -142,17 +184,23 @@ class InputMapper:
         result = self._driver.call("list_windows", on_screen_only=True)
         windows = (result.get("structuredContent") or {}).get("windows") or []
         under = [window for window in windows if _contains(window, px, py)]
+        self._keys_blocked = False
         if not under:
+            self._target = None
             return
         window = max(under, key=lambda item: item.get("z_index") or 0)
-        self._driver.call("bring_to_front", pid=window["pid"], window_id=window["window_id"])
+        self._act("bring_to_front", pid=window["pid"], window_id=window["window_id"])
+        self._target = {"pid": window["pid"], "window_id": window["window_id"]}
+
+
+def _is_ordinary(window: dict[str, Any]) -> bool:
+    """An app's window on screen. The driver's own full-screen surface sits in the list too."""
+    return window.get("layer") in (0, None) and window.get("is_on_screen") is not False \
+        and window.get("pid") is not None and window.get("app_name") != _DRIVER_APP
 
 
 def _contains(window: dict[str, Any], x: float, y: float) -> bool:
-    if window.get("layer") not in (0, None) or window.get("is_on_screen") is False or window.get("pid") is None:
-        return False
-    # The driver's own full-screen surface sits in the window list, and isn't where a tap is going.
-    if window.get("app_name") == _DRIVER_APP:
+    if not _is_ordinary(window):
         return False
     bounds = window.get("bounds") or {}
     left, top = bounds.get("x", 0.0), bounds.get("y", 0.0)

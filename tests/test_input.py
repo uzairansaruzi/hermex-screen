@@ -1,5 +1,6 @@
 import unittest
 
+from hermex_screen.driver import DriverUnavailable
 from hermex_screen.input import InputMapper
 from hermex_screen.keys import Paste, Press, action_for
 from hermex_screen.rfb import Key, Pointer
@@ -23,6 +24,70 @@ class FakeDriver:
 def window(pid, window_id, z, x=0, y=0, w=500, h=500):
     return {"pid": pid, "window_id": window_id, "z_index": z, "layer": 0, "is_on_screen": True,
             "bounds": {"x": x, "y": y, "width": w, "height": h}}
+
+
+class Lost(Exception):
+    pass
+
+
+class FenceTests(unittest.TestCase):
+    def test_losing_control_stops_the_rest_of_a_batch(self):
+        """Hand Back can arrive while earlier keys are still going out."""
+        allowed = [True, False]
+        driver = FakeDriver()
+
+        class Guard:
+            def __enter__(self):
+                if not allowed.pop(0):
+                    raise Lost()
+
+            def __exit__(self, *exc):
+                return False
+
+        mapper = InputMapper(driver, "darwin", guard=Guard)
+        with self.assertRaises(Lost):
+            mapper.apply([Key(True, 0x61), Key(True, 0x62), Key(True, 0x63)])
+        self.assertEqual([arguments["key"] for _, arguments in driver.calls], ["a"])
+
+
+class TargetTests(unittest.TestCase):
+    def tapped(self, windows):
+        driver = FakeDriver(windows)
+        mapper = InputMapper(driver, "darwin")
+        mapper.apply([Pointer(1, 100, 100), Pointer(0, 100, 100)])
+        driver.calls.clear()
+        return driver, mapper
+
+    def test_keys_go_straight_on_while_the_tapped_app_stays_in_front(self):
+        driver, mapper = self.tapped([window(1, 10, z=5)])
+        mapper.apply([Key(True, 0x61)])
+        self.assertEqual(driver.names(), ["list_windows", "press_key"])
+
+    def test_another_app_taking_the_front_gives_way_before_a_key_goes_out(self):
+        driver, mapper = self.tapped([window(1, 10, z=5)])
+        driver.windows = [window(1, 10, z=5), window(2, 20, z=9, x=900)]
+        mapper.apply([Key(True, 0x61)])
+        self.assertEqual(driver.names(), ["list_windows", "bring_to_front", "press_key"])
+        self.assertEqual(driver.calls[1][1], {"pid": 1, "window_id": 10})
+
+    def test_a_tapped_window_that_has_gone_drops_the_keys(self):
+        driver, mapper = self.tapped([window(1, 10, z=5)])
+        driver.windows = [window(2, 20, z=9, x=900)]
+        original = driver.call
+
+        def refuse(name, **arguments):
+            if name == "bring_to_front":
+                raise DriverUnavailable("no such window")
+            return original(name, **arguments)
+        driver.call = refuse
+        mapper.apply([Key(True, 0x61), Key(True, 0x21)])
+        mapper.apply([Key(True, 0x62)])
+        self.assertNotIn("press_key", driver.names())
+        self.assertNotIn("clipboard_write", driver.names())
+
+        driver.call = original
+        mapper.apply([Pointer(1, 950, 100), Pointer(0, 950, 100), Key(True, 0x63)])
+        self.assertEqual(driver.calls[-1][1]["key"], "c", "a new tap sets the target again")
 
 
 class KeyTests(unittest.TestCase):

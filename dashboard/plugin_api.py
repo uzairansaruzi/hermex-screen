@@ -12,6 +12,7 @@ own gate. A plugin can add REST routes and sockets but no RPC methods, so everyt
                              the dashboard's gate, and `?stream_ticket=` names the viewer.
 
 Close codes match stock: 4000 control taken, 4001 screen gone, 4401 bad ticket, 1003 protocol error.
+This plugin adds 4002: its own timer ended this viewer's takeover, or another client handed back.
 """
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ import subprocess
 import sys
 import threading
 import time
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -35,13 +35,13 @@ if _ROOT not in sys.path:
     sys.path.append(_ROOT)
 
 from hermex_screen import VERSION  # noqa: E402
-from hermex_screen.control import Control, viewer_hash  # noqa: E402
-from hermex_screen.driver import CuaDriver, DriverUnavailable, contract_problem  # noqa: E402
+from hermex_screen.control import Control, ControlLost  # noqa: E402
+from hermex_screen.driver import CuaDriver, DriverUnavailable  # noqa: E402
 from hermex_screen.frames import encode, fingerprint  # noqa: E402
 from hermex_screen.input import InputMapper  # noqa: E402
 from hermex_screen.rfb import (  # noqa: E402
-    SECURITY_NONE, SECURITY_OK, VERSION as RFB_VERSION, ClientParser, Key, Pointer, ProtocolError, UpdateRequest,
-    desktop_size_update, jpeg_update, server_init,
+    SECURITY_NONE, SECURITY_OK, VERSION as RFB_VERSION, ClientParser, HandshakeReply, Key, Pointer, ProtocolError,
+    UpdateRequest, desktop_size_update, jpeg_update, server_init,
 )
 
 logger = logging.getLogger(__name__)
@@ -51,15 +51,19 @@ _ROUTES = ["GET /capabilities", "GET /status", "GET /doctor", "POST /observe", "
            "POST /lease/release", "WS /stream"]
 _CLOSE_CONTROL_TAKEN = 4000
 _CLOSE_SCREEN_GONE = 4001
+_CLOSE_HANDED_BACK = 4002
 _CLOSE_BAD_TICKET = 4401
 _CLOSE_PROTOCOL = 1003
 _TICKET_LIFETIME = 30.0
+_INPUT_QUEUE_LIMIT = 4096
 _FRAME_INTERVAL = 0.15
 _UNCHANGED_INTERVAL = 0.2
 _CLIPBOARD_CLEAR_DELAY = 2.0
 _WINDOWS_OPT_IN_ENV = "HERMEX_SCREEN_WINDOWS"
 
 _driver = CuaDriver()
+_lock = threading.Lock()
+_control_instance: Optional[Control] = None
 _tickets: dict[str, tuple[str, float]] = {}
 _minted: set[str] = set()
 
@@ -84,11 +88,15 @@ def _profile_paths() -> list[str]:
     return [str(profile.path) for profile in list_profiles()]
 
 
-@lru_cache(maxsize=1)
 def _control() -> Control:
-    from hermes_constants import get_hermes_home
-    from tools.bot_desktop import lease
-    return Control(lease, _profile_paths, Path(get_hermes_home()) / "hermex-screen" / "hold.json")
+    """The one control object, which owns the hold file and its timer."""
+    global _control_instance
+    with _lock:
+        if _control_instance is None:
+            from hermes_constants import get_hermes_home
+            from tools.bot_desktop import lease
+            _control_instance = Control(lease, _profile_paths, Path(get_hermes_home()) / "hermex-screen" / "hold.json")
+        return _control_instance
 
 
 def _ws_authorized(ws: WebSocket) -> bool:
@@ -144,8 +152,8 @@ def _control_problem() -> Optional[str]:
 def _driver_facts() -> dict[str, Any]:
     """The driver's version and whether it can do the job. Starts it, which sends no input."""
     try:
-        problem = contract_problem(_driver.tools())
-        return {"available": True, "version": _driver.version, "problem": problem}
+        _driver.tools()
+        return {"available": True, "version": _driver.version, "problem": _driver.problem}
     except DriverUnavailable as exc:
         return {"available": False, "version": None, "problem": str(exc)}
     except Exception as exc:
@@ -172,8 +180,8 @@ def get_status() -> JSONResponse:
     body: dict[str, Any] = {"plugin_version": VERSION, "supported": refusal is None, "refusal": refusal, "platform": sys.platform}
     if refusal is None:
         driver = _driver_facts()
-        body.update(driver=driver, permissions=_permissions() if driver["available"] else None, locked=_locked(),
-                    lease=_control().public_lease())
+        body.update(driver=driver, permissions=_permissions() if driver["available"] and not driver["problem"] else None,
+                    locked=_locked(), locked_input=sys.platform == "darwin", lease=_control().public_lease())
     return JSONResponse(body)
 
 
@@ -189,7 +197,7 @@ def get_doctor() -> JSONResponse:
     check("isolation", _isolation_problem())
     driver = _driver_facts()
     check("driver", driver["problem"])
-    if driver["available"]:
+    if driver["available"] and not driver["problem"]:
         permissions = _permissions() or {}
         check("accessibility", None if permissions.get("accessibility") else "Accessibility isn't granted to CuaDriver.")
         check("screen_recording", None if permissions.get("screen_recording") else "Screen Recording isn't granted to CuaDriver.")
@@ -207,17 +215,14 @@ def post_observe() -> JSONResponse:
     if refusal := _control_problem():
         return _refused(403, refusal)
     viewer_id = secrets.token_urlsafe(16)
-    _minted.add(viewer_id)
     ticket = secrets.token_urlsafe(24)
-    _prune_tickets()
-    _tickets[ticket] = (viewer_id, time.monotonic() + _TICKET_LIFETIME)
-    return JSONResponse({"viewer_id": viewer_id, "stream_ticket": ticket, "lease": _control().public_lease()})
-
-
-def _prune_tickets() -> None:
     now = time.monotonic()
-    for ticket in [key for key, (_, expires) in _tickets.items() if expires < now]:
-        del _tickets[ticket]
+    with _lock:
+        _minted.add(viewer_id)
+        for stale in [key for key, (_, expires) in _tickets.items() if expires < now]:
+            del _tickets[stale]
+        _tickets[ticket] = (viewer_id, now + _TICKET_LIFETIME)
+    return JSONResponse({"viewer_id": viewer_id, "stream_ticket": ticket, "lease": _control().public_lease()})
 
 
 @router.post("/lease/acquire")
@@ -225,8 +230,12 @@ def post_acquire(body: dict[str, Any] = Body(default={})) -> JSONResponse:
     if refusal := _control_problem():
         return _refused(403, refusal)
     viewer_id = str(body.get("viewer_id") or "").strip()
-    if viewer_id not in _minted:
+    with _lock:
+        minted = viewer_id in _minted
+    if not minted:
         return _refused(409, "viewer_id was not minted by /observe.", code="viewer_mismatch")
+    if _driver_facts()["problem"]:
+        return _refused(403, "This host's driver can't do the job, so control stays with the bot.")
     _control().acquire(viewer_id)
     return JSONResponse({"lease": _control().public_lease()})
 
@@ -248,7 +257,8 @@ async def stream(ws: WebSocket) -> None:
         await ws.close(code=1008)
         return
     await ws.accept()
-    entry = _tickets.pop(ws.query_params.get("stream_ticket", ""), None)
+    with _lock:
+        entry = _tickets.pop(ws.query_params.get("stream_ticket", ""), None)
     if entry is None or entry[1] < time.monotonic():
         await ws.close(code=_CLOSE_BAD_TICKET, reason="ticket missing, expired or used")
         return
@@ -269,8 +279,10 @@ class _Stream:
         self._loop = asyncio.get_running_loop()
         self._wanted = asyncio.Event()
         self._evicted = asyncio.Event()
-        self._input: asyncio.Queue[object] = asyncio.Queue()
-        self._mapper = InputMapper(_driver, sys.platform)
+        self._handed_back = asyncio.Event()
+        # Bounded so a long paste on a slow host pushes back on the socket rather than piling up here.
+        self._input: asyncio.Queue[object] = asyncio.Queue(maxsize=_INPUT_QUEUE_LIMIT)
+        self._mapper = InputMapper(_driver, sys.platform, guard=lambda: self._control.while_holding(viewer_id))
         self._held_ever = self._control.may_send_input(viewer_id)
         self._clear_clipboard: Optional[asyncio.TimerHandle] = None
         self._size = (0, 0)
@@ -319,18 +331,25 @@ class _Stream:
         if holder == self._viewer_id:
             self._held_ever = True
             return
-        if self._held_ever and (holder is not None or expired):
-            self._held_ever = False
+        was_holder, self._held_ever = self._held_ever, False
+        if was_holder and holder is not None:
             self._loop.call_soon_threadsafe(self._evicted.set)
+        elif was_holder and expired:
+            self._loop.call_soon_threadsafe(self._handed_back.set)
 
     async def _watch_eviction(self) -> None:
-        await self._evicted.wait()
-        await self._ws.close(code=_CLOSE_CONTROL_TAKEN, reason="control-taken")
+        taken = asyncio.create_task(self._evicted.wait())
+        ended = asyncio.create_task(self._handed_back.wait())
+        await asyncio.wait({taken, ended}, return_when=asyncio.FIRST_COMPLETED)
+        for task in (taken, ended):
+            task.cancel()
+        if self._evicted.is_set():
+            await self._ws.close(code=_CLOSE_CONTROL_TAKEN, reason="control-taken")
+        else:
+            await self._ws.close(code=_CLOSE_HANDED_BACK, reason="handed-back")
 
     async def _read(self) -> None:
         parser = ClientParser()
-        sent = 0
-        total = 0
         while True:
             message = await self._ws.receive()
             if message.get("type") == "websocket.disconnect":
@@ -339,31 +358,21 @@ class _Stream:
             if data is None:
                 await self._ws.close(code=_CLOSE_PROTOCOL, reason="RFB is binary")
                 return
-            total += len(data)
-            # The fixed handshake: a version answer, the security choice, then ClientInit.
-            if sent == 0 and total >= 12:
-                await self._ws.send_bytes(SECURITY_NONE)
-                sent = 1
-            if sent == 1 and total >= 13:
-                await self._ws.send_bytes(SECURITY_OK)
-                sent = 2
-            if sent == 2 and total >= 14:
-                await self._send_init()
-                sent = 3
             try:
                 messages = parser.feed(data)
             except ProtocolError as exc:
                 await self._ws.close(code=_CLOSE_PROTOCOL, reason=str(exc)[:100])
                 return
             for item in messages:
-                if isinstance(item, UpdateRequest):
+                if isinstance(item, HandshakeReply):
+                    await self._ws.send_bytes({
+                        "security": SECURITY_NONE, "security_result": SECURITY_OK,
+                        "server_init": server_init(self._size[0], self._size[1])}[item.stage])
+                elif isinstance(item, UpdateRequest):
                     self._wanted.set()
                 elif isinstance(item, (Key, Pointer)) and self._control.may_send_input(self._viewer_id):
                     self._control.note_input()
-                    self._input.put_nowait(item)
-
-    async def _send_init(self) -> None:
-        await self._ws.send_bytes(server_init(self._size[0], self._size[1]))
+                    await self._input.put(item)
 
     async def _apply_input(self) -> None:
         while True:
@@ -374,6 +383,8 @@ class _Stream:
                 continue
             try:
                 await asyncio.to_thread(self._mapper.apply, events)
+            except ControlLost:
+                continue
             except DriverUnavailable as exc:
                 logger.info("hermex-screen: input refused: %s", exc)
             if self._mapper.pasted:
@@ -394,7 +405,12 @@ class _Stream:
             await self._wanted.wait()
             started = self._loop.time()
             pointer = self._mapper.pointer if self._control.may_send_input(self._viewer_id) else None
-            capture = await asyncio.to_thread(_driver.capture)
+            try:
+                capture = await asyncio.to_thread(_driver.capture)
+            except (DriverUnavailable, OSError):
+                # Not a clean close: the viewer reads /status again to say what went wrong.
+                await self._ws.close(code=_CLOSE_SCREEN_GONE, reason="capture failed")
+                return
             print_ = fingerprint(capture.png, pointer)
             if print_ == last_print:
                 await asyncio.sleep(_UNCHANGED_INTERVAL)

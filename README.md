@@ -20,7 +20,7 @@ Frames and input go directly between this host and your phone, over the dashboar
 
 A takeover holds every Profile's lease, so `computer_use` pauses on every bot on this host and answers `human_has_control`. It ends on Hand Back, or after 15 minutes with no input from the phone, connected or not.
 
-A window that didn't exist before can act in the moment before the 2-second loop reaches a brand-new Profile. A Windows host has no cross-process lock on the lease file. Both are accepted for a short takeover.
+A brand-new Profile can act in the moment before the 2-second loop reaches it. A Windows host has no cross-process lock on the lease file. Both are accepted for a short takeover.
 
 These rely on private Hermes APIs, so control is refused if they change, and `/doctor` says so.
 

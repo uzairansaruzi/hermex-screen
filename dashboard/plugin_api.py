@@ -367,11 +367,13 @@ class _Stream:
 
     async def _apply_input(self) -> None:
         while True:
-            event = await self._input.get()
+            events = [await self._input.get()]
+            while not self._input.empty():
+                events.append(self._input.get_nowait())
             if not self._control.may_send_input(self._viewer_id):
                 continue
             try:
-                await asyncio.to_thread(self._mapper.apply, event)
+                await asyncio.to_thread(self._mapper.apply, events)
             except DriverUnavailable as exc:
                 logger.info("hermex-screen: input refused: %s", exc)
             if self._mapper.pasted:

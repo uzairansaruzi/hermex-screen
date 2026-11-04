@@ -39,22 +39,27 @@ class KeyTests(unittest.TestCase):
 
     def test_a_held_modifier_goes_with_the_next_key_and_key_up_sends_nothing(self):
         driver = FakeDriver()
-        mapper = InputMapper(driver, "darwin")
-        mapper.apply(Key(True, 0xFFEB))
-        mapper.apply(Key(True, 0x63))
-        mapper.apply(Key(False, 0x63))
-        mapper.apply(Key(False, 0xFFEB))
-        mapper.apply(Key(True, 0x41))
+        mapper = InputMapper(driver, "darwin", sleep=lambda _: None)
+        mapper.apply([Key(True, 0xFFEB), Key(True, 0x63), Key(False, 0x63), Key(False, 0xFFEB), Key(True, 0x41)])
         self.assertEqual(driver.calls, [
             ("press_key", {"key": "c", "modifiers": ["cmd"], "scope": "desktop"}),
             ("press_key", {"key": "a", "modifiers": ["shift"], "scope": "desktop"}),
         ])
 
+    def test_a_run_of_characters_with_no_key_pastes_together_and_order_holds(self):
+        waits = []
+        driver = FakeDriver()
+        mapper = InputMapper(driver, "darwin", sleep=waits.append)
+        mapper.apply([Key(True, 0x61), Key(True, 0x21), Key(True, 0x40), Key(True, 0x62)])
+        self.assertEqual([arguments.get("key") or arguments.get("text") or arguments.get("keys") for _, arguments in driver.calls],
+                         ["a", "!@", ["cmd", "v"], "b"])
+        self.assertEqual(len(waits), 1, "the app reads the clipboard later, so the next write waits")
+
     def test_a_character_with_no_key_pastes_and_the_clipboard_is_cleared_after(self):
         driver = FakeDriver()
-        mapper = InputMapper(driver, "win32")
-        mapper.apply(Key(True, 0x21))
-        self.assertEqual(driver.calls, [("clipboard_write", {"text": "!"}),
+        mapper = InputMapper(driver, "win32", sleep=lambda _: None)
+        mapper.apply([Key(True, 0x21), Key(False, 0x21), Key(True, 0xE9), Key(False, 0xE9)])
+        self.assertEqual(driver.calls, [("clipboard_write", {"text": "!é"}),
                                         ("hotkey", {"keys": ["ctrl", "v"], "scope": "desktop"})])
         mapper.clear_clipboard()
         self.assertEqual(driver.calls[-1], ("clipboard_write", {"text": ""}))
@@ -64,12 +69,12 @@ class KeyTests(unittest.TestCase):
 
 class PointerTests(unittest.TestCase):
     def test_a_tap_brings_the_topmost_window_under_it_forward_before_clicking(self):
-        driver = FakeDriver([window(1, 10, z=1), window(2, 20, z=5), window(3, 30, z=9, x=900)])
-        mapper = InputMapper(driver, "darwin")
+        driver_surface = {**window(9, 90, z=99), "app_name": "Cua Driver"}
+        driver = FakeDriver([window(1, 10, z=1), window(2, 20, z=5), window(3, 30, z=9, x=900), driver_surface])
+        mapper = InputMapper(driver, "darwin", sleep=lambda _: None)
         mapper.scale = 2.0
         mapper.point_scale = 2.0
-        mapper.apply(Pointer(1, 100, 100))
-        mapper.apply(Pointer(0, 100, 100))
+        mapper.apply([Pointer(1, 100, 100), Pointer(0, 100, 100)])
         self.assertEqual(driver.calls, [
             ("list_windows", {"on_screen_only": True}),
             ("bring_to_front", {"pid": 2, "window_id": 20}),
@@ -78,24 +83,23 @@ class PointerTests(unittest.TestCase):
 
     def test_a_press_that_moved_is_a_drag_and_right_button_stays_right(self):
         driver = FakeDriver()
-        mapper = InputMapper(driver, "darwin")
-        mapper.apply(Pointer(1, 10, 10))
-        mapper.apply(Pointer(1, 50, 10))
-        mapper.apply(Pointer(0, 50, 10))
+        mapper = InputMapper(driver, "darwin", sleep=lambda _: None)
+        mapper.apply([Pointer(1, 10, 10), Pointer(1, 50, 10), Pointer(0, 50, 10)])
         name, arguments = driver.calls[-1]
         self.assertEqual(name, "drag")
         self.assertEqual((arguments["from_x"], arguments["to_x"]), (10, 50))
 
-        mapper.apply(Pointer(4, 5, 5))
-        mapper.apply(Pointer(0, 5, 5))
+        mapper.apply([Pointer(4, 5, 5), Pointer(0, 5, 5)])
         self.assertEqual(driver.calls[-1][1]["button"], "right")
 
-    def test_wheel_buttons_scroll_where_the_pointer_is(self):
+    def test_a_wheel_gestures_clicks_merge_into_one_scroll(self):
         driver = FakeDriver()
         mapper = InputMapper(driver, "darwin")
-        mapper.apply(Pointer(16, 7, 8))
-        mapper.apply(Pointer(0, 7, 8))
-        self.assertEqual(driver.calls, [("scroll", {"direction": "down", "amount": 1, "x": 7, "y": 8, "scope": "desktop"})])
+        mapper.apply([Pointer(16, 7, 8), Pointer(0, 7, 8), Pointer(16, 7, 8), Pointer(0, 7, 8), Pointer(8, 7, 8), Pointer(0, 7, 8)])
+        self.assertEqual(driver.calls, [
+            ("scroll", {"direction": "down", "amount": 2, "x": 7, "y": 8, "scope": "desktop"}),
+            ("scroll", {"direction": "up", "amount": 1, "x": 7, "y": 8, "scope": "desktop"}),
+        ])
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ These rely on private Hermes APIs, so control is refused if they change, and `/d
 
 ## Windows
 
-Off until the host sets `HERMEX_SCREEN_WINDOWS=1` for the dashboard. Untested beyond that so far.
+Off until the host sets `HERMEX_SCREEN_WINDOWS=1` for the dashboard, and untested so far: see [TESTING-WINDOWS.md](TESTING-WINDOWS.md). Hermes has to run in the logged-in session, because a service can't see the desktop. Unlock the PC at the computer, since Windows doesn't allow remote input on its lock screen.
 
 ## Tests
 

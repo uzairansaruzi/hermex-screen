@@ -20,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-import subprocess
 import sys
 import threading
 import time
@@ -39,6 +38,7 @@ from hermex_screen.control import Control, ControlLost  # noqa: E402
 from hermex_screen.driver import CuaDriver, DriverUnavailable  # noqa: E402
 from hermex_screen.frames import encode, fingerprint  # noqa: E402
 from hermex_screen.input import InputMapper  # noqa: E402
+from hermex_screen.platforms import lock_accepts_input, locked, refusal as platform_refusal, windows_opted_in  # noqa: E402
 from hermex_screen.rfb import (  # noqa: E402
     SECURITY_NONE, SECURITY_OK, VERSION as RFB_VERSION, ClientParser, HandshakeReply, Key, Pointer, ProtocolError,
     UpdateRequest, desktop_size_update, jpeg_update, server_init,
@@ -59,28 +59,12 @@ _INPUT_QUEUE_LIMIT = 4096
 _FRAME_INTERVAL = 0.15
 _UNCHANGED_INTERVAL = 0.2
 _CLIPBOARD_CLEAR_DELAY = 2.0
-_WINDOWS_OPT_IN_ENV = "HERMEX_SCREEN_WINDOWS"
 
 _driver = CuaDriver()
 _lock = threading.Lock()
 _control_instance: Optional[Control] = None
 _tickets: dict[str, tuple[str, float]] = {}
 _minted: set[str] = set()
-
-
-def _windows_opted_in() -> bool:
-    import os
-    return os.environ.get(_WINDOWS_OPT_IN_ENV, "").strip() == "1"
-
-
-def _platform_refusal() -> Optional[str]:
-    """Why this plugin won't serve this host. Linux has stock Bot Screen."""
-    if sys.platform == "darwin":
-        return None
-    if sys.platform == "win32":
-        return None if _windows_opted_in() else (
-            f"Windows isn't supported yet. A tester can set {_WINDOWS_OPT_IN_ENV}=1 for the dashboard to opt in.")
-    return "This host has stock Bot Screen, so it doesn't use this plugin."
 
 
 def _profile_paths() -> list[str]:
@@ -111,17 +95,6 @@ def _refused(status: int, message: str, code: Optional[str] = None) -> JSONRespo
     return JSONResponse(body, status_code=status)
 
 
-def _locked() -> Optional[bool]:
-    """Whether the console session's screen is locked. None where this can't tell."""
-    if sys.platform != "darwin":
-        return None
-    try:
-        out = subprocess.run(["/usr/sbin/ioreg", "-n", "Root", "-d1"], capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return "CGSSessionScreenIsLocked" in out
-
-
 def _isolation_problem() -> Optional[str]:
     from hermes_cli.config import load_config_readonly
     isolation = ((load_config_readonly() or {}).get("plugins") or {}).get("isolation") or "in_process"
@@ -146,7 +119,7 @@ def _private_api_problem() -> Optional[str]:
 
 
 def _control_problem() -> Optional[str]:
-    return _platform_refusal() or _private_api_problem()
+    return platform_refusal() or _private_api_problem()
 
 
 def _driver_facts() -> dict[str, Any]:
@@ -171,7 +144,7 @@ def _permissions() -> Optional[dict[str, Any]]:
 
 @router.get("/capabilities")
 def get_capabilities() -> JSONResponse:
-    return JSONResponse({"plugin_version": VERSION, "routes": _ROUTES, "windows_opt_in": _windows_opted_in()})
+    return JSONResponse({"plugin_version": VERSION, "routes": _ROUTES, "windows_opt_in": windows_opted_in()})
 
 
 @router.get("/status")
@@ -181,7 +154,7 @@ def get_status() -> JSONResponse:
     if refusal is None:
         driver = _driver_facts()
         body.update(driver=driver, permissions=_permissions() if driver["available"] and not driver["problem"] else None,
-                    locked=_locked(), locked_input=sys.platform == "darwin", lease=_control().public_lease())
+                    locked=locked(), locked_input=lock_accepts_input(), lease=_control().public_lease())
     return JSONResponse(body)
 
 
@@ -192,7 +165,7 @@ def get_doctor() -> JSONResponse:
     def check(name: str, problem: Optional[str]) -> None:
         checks.append({"name": name, "ok": problem is None, "detail": problem})
 
-    check("platform", _platform_refusal())
+    check("platform", platform_refusal())
     check("hermes_apis", _private_api_problem())
     check("isolation", _isolation_problem())
     driver = _driver_facts()

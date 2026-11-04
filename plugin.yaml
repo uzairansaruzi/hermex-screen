@@ -1,0 +1,12 @@
+name: hermex-screen
+label: Hermex Screen
+kind: standalone
+version: 0.1.0
+description: >
+  Watch and control this computer's real desktop from the Hermex iPhone app, for hosts
+  whose Hermes has no stock Bot Screen. Frames and input travel directly between this
+  host and the phone over the dashboard's own address. Nothing runs until it's installed.
+author: Uzair Ansar
+homepage: https://github.com/uzairansaruzi/hermex-screen
+license: MIT
+requires_hermes: ">=0.21.2"

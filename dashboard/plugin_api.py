@@ -134,12 +134,14 @@ def _driver_facts() -> dict[str, Any]:
         return {"available": False, "version": None, "problem": f"The driver couldn't start: {type(exc).__name__}."}
 
 
-def _permissions() -> Optional[dict[str, Any]]:
+def _permissions() -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    """What the driver says is granted, or why it couldn't say. A failed check is a driver problem,
+    not a missing permission."""
     try:
         facts = _driver.call("check_permissions").get("structuredContent") or {}
-    except DriverUnavailable:
-        return None
-    return {"accessibility": facts.get("accessibility"), "screen_recording": facts.get("screen_recording")}
+    except DriverUnavailable as exc:
+        return None, f"cua-driver couldn't check its permissions: {exc}"
+    return {"accessibility": facts.get("accessibility"), "screen_recording": facts.get("screen_recording")}, None
 
 
 @router.get("/capabilities")
@@ -153,8 +155,11 @@ def get_status() -> JSONResponse:
     body: dict[str, Any] = {"plugin_version": VERSION, "supported": refusal is None, "refusal": refusal, "platform": sys.platform}
     if refusal is None:
         driver = _driver_facts()
-        body.update(driver=driver, permissions=_permissions() if driver["available"] and not driver["problem"] else None,
-                    locked=locked(), locked_input=lock_accepts_input(), lease=_control().public_lease())
+        permissions = None
+        if driver["available"] and not driver["problem"]:
+            permissions, driver["problem"] = _permissions()
+        body.update(driver=driver, permissions=permissions, locked=locked(), locked_input=lock_accepts_input(),
+                    lease=_control().public_lease())
     return JSONResponse(body)
 
 
@@ -171,9 +176,13 @@ def get_doctor() -> JSONResponse:
     driver = _driver_facts()
     check("driver", driver["problem"])
     if driver["available"] and not driver["problem"]:
-        permissions = _permissions() or {}
-        check("accessibility", None if permissions.get("accessibility") else "Accessibility isn't granted to CuaDriver.")
-        check("screen_recording", None if permissions.get("screen_recording") else "Screen Recording isn't granted to CuaDriver.")
+        permissions, unchecked = _permissions()
+        if permissions is None:
+            check("accessibility", unchecked)
+            check("screen_recording", unchecked)
+        else:
+            check("accessibility", None if permissions["accessibility"] else "Accessibility isn't granted to CuaDriver.")
+            check("screen_recording", None if permissions["screen_recording"] else "Screen Recording isn't granted to CuaDriver.")
     try:
         from PIL import Image  # noqa: F401
         check("pillow", None)

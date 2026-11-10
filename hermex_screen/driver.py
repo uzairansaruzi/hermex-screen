@@ -167,8 +167,6 @@ class CuaDriver:
                 facts = result.get("structuredContent") or {}
                 return Capture(png=base64.b64decode(part["data"]), width=int(facts.get("screenshot_width") or 0),
                                height=int(facts.get("screenshot_height") or 0))
-        logger.info("hermex-screen: cua-driver returned no picture, so the next call starts a fresh one")
-        self.stop()
         raise DriverUnavailable("cua-driver returned no picture.")
 
     def stop(self) -> None:

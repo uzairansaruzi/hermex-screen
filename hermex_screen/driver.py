@@ -31,6 +31,10 @@ _REQUIRED = {
     "bring_to_front": ("pid", "window_id"),
     "check_permissions": (),
 }
+# Reads a healthy driver always answers. A child that refuses one is unwell (seen after hours of
+# uptime: every call refused, quickly), so it's stopped and the next call starts a fresh one. A
+# fresh child refusing too is a real problem, and is reported rather than retried.
+_RESTART_ON_REFUSAL = frozenset({"get_desktop_state", "check_permissions"})
 
 
 class DriverUnavailable(RuntimeError):
@@ -144,10 +148,16 @@ class CuaDriver:
             if self.problem:
                 raise DriverUnavailable(self.problem)
             reply = self._request("tools/call", {"name": name, "arguments": arguments})
-        result = reply.get("result") or {}
-        if reply.get("error") or result.get("isError"):
-            text = " ".join(part.get("text", "") for part in result.get("content") or [] if part.get("type") == "text")
-            raise DriverUnavailable(text[:200] or f"cua-driver refused {name}.")
+            result = reply.get("result") or {}
+            if reply.get("error") or result.get("isError"):
+                text = (" ".join(part.get("text", "") for part in result.get("content") or [] if part.get("type") == "text")
+                        or str((reply.get("error") or {}).get("message") or ""))
+                message = text.strip()[:200] or f"cua-driver refused {name}."
+                if name in _RESTART_ON_REFUSAL:
+                    logger.info("hermex-screen: cua-driver refused %s, so the next call starts a fresh one: %s",
+                                name, message)
+                    self.stop()
+                raise DriverUnavailable(message)
         return result
 
     def capture(self) -> Capture:
